@@ -49,6 +49,9 @@ def create_refresh_token(user_id: str) -> str:
 STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
 EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
 APP_NAME = "tellvy"
+
+# Gemini AI
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 storage_key = None
 
 def init_storage():
@@ -308,6 +311,17 @@ async def admin_update_client(client_id: str, req: UpdateRedirectRequest, user: 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Client not found")
     return {"message": "Updated"}
+
+@api_router.delete("/admin/clients/{client_id}")
+async def admin_delete_client(client_id: str, user: dict = Depends(require_role("super_admin"))):
+    client_doc = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not client_doc:
+        raise HTTPException(status_code=404, detail="Client not found")
+    await db.clients.delete_one({"id": client_id})
+    await db.users.delete_one({"client_id": client_id})
+    await db.team_members.delete_many({"client_id": client_id})
+    await log_audit(user["_id"], user.get("name", "Admin"), "deleted_client", f"Deleted client '{client_doc['business_name']}' (ID: {client_id})")
+    return {"message": "Deleted"}
 
 @api_router.put("/admin/clients/{client_id}/kill-switch")
 async def toggle_kill_switch(client_id: str, user: dict = Depends(require_role("super_admin"))):
@@ -707,12 +721,18 @@ async def get_category_tags(category: str):
 @api_router.post("/ai/magic-write")
 async def magic_write(req: MagicWriteRequest):
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        chat = LlmChat(api_key=EMERGENT_KEY, session_id=f"magic-write-{uuid.uuid4()}", system_message="You are a helpful review writer. Generate short, natural-sounding Google reviews. Keep it to 2 sentences maximum. Sound like a real customer, not robotic. Do not use quotation marks around the review.")
-        chat.with_model("gemini", "gemini-3-flash-preview")
+        from google import genai
+        from google.genai import types
+        gemini = genai.Client(api_key=GEMINI_API_KEY)
         prompt = f"Write a natural 2-sentence positive Google review mentioning {req.member_name}. The review should touch on these qualities: {', '.join(req.tags)}. Category: {req.category}. Sound authentic and human."
-        response = await chat.send_message(UserMessage(text=prompt))
-        return {"review_draft": response, "member_name": req.member_name, "tags": req.tags}
+        result = await gemini.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction="You are a helpful review writer. Generate short, natural-sounding Google reviews. Keep it to 2 sentences maximum. Sound like a real customer, not robotic. Do not use quotation marks around the review.",
+            ),
+        )
+        return {"review_draft": result.text, "member_name": req.member_name, "tags": req.tags}
     except Exception as e:
         logger.error(f"AI Magic Write error: {e}")
         tags_str = " and ".join(req.tags[:2]) if req.tags else "professional"
@@ -721,13 +741,19 @@ async def magic_write(req: MagicWriteRequest):
 @api_router.post("/ai/response-assist")
 async def response_assist(req: ResponseAssistRequest):
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        chat = LlmChat(api_key=EMERGENT_KEY, session_id=f"response-{uuid.uuid4()}", system_message="You are a professional business response writer. Write brief, warm responses to customer reviews. IMPORTANT: Never repeat the reviewer's name or any specific service/medical details mentioned in the review to protect privacy (HIPAA/GDPR). Keep responses to 2-3 sentences.")
-        chat.with_model("gemini", "gemini-3-flash-preview")
+        from google import genai
+        from google.genai import types
+        gemini = genai.Client(api_key=GEMINI_API_KEY)
         sentiment = "positive" if req.rating >= 4 else "mixed" if req.rating == 3 else "negative"
         prompt = f"Write a professional business response to this {sentiment} {req.rating}-star review: \"{req.review_text}\". Category: {req.category}. Remember: do NOT mention the reviewer's name or any specific services."
-        response = await chat.send_message(UserMessage(text=prompt))
-        return {"response_draft": response}
+        result = await gemini.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction="You are a professional business response writer. Write brief, warm responses to customer reviews. IMPORTANT: Never repeat the reviewer's name or any specific service/medical details mentioned in the review to protect privacy (HIPAA/GDPR). Keep responses to 2-3 sentences.",
+            ),
+        )
+        return {"response_draft": result.text}
     except Exception as e:
         logger.error(f"AI Response Assist error: {e}")
         return {"response_draft": "Thank you for taking the time to share your feedback. We truly value your experience and are committed to providing the best service possible."}
