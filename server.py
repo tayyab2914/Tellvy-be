@@ -4,12 +4,13 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, UploadFile, File, Query, Header, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, UploadFile, File, Query, Header, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import os
+import asyncio
 import logging
 import uuid
 import bcrypt
@@ -52,6 +53,8 @@ APP_NAME = "tellvy"
 
 # Gemini AI
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Outscraper
+OUTSCRAPER_API_KEY = os.environ.get("OUTSCRAPER_API_KEY")
 storage_key = None
 
 def init_storage():
@@ -118,6 +121,119 @@ async def log_audit(user_id: str, user_name: str, action: str, details: str):
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
+# ===================== OUTSCRAPER REVIEW IMPORT =====================
+
+def _detect_source(url: str) -> str:
+    lower = url.lower()
+    if "booking.com" in lower:
+        return "Booking.com"
+    if "google.com/maps" in lower or "maps.google" in lower or "goo.gl/maps" in lower or "maps.app.goo.gl" in lower:
+        return "Google Maps"
+    return ""
+
+def _fetch_outscraper_sync(endpoint: str, params: dict, api_key: str) -> dict:
+    resp = requests.get(endpoint, params=params, headers={"X-API-KEY": api_key}, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+async def import_outscraper_reviews(client_id: str, outscraper_url: str):
+    if not OUTSCRAPER_API_KEY:
+        logger.warning("OUTSCRAPER_API_KEY not set — skipping review import")
+        return
+    source = _detect_source(outscraper_url)
+    if not source:
+        logger.warning(f"Unrecognised Outscraper URL for client {client_id}: {outscraper_url}")
+        return
+    try:
+        if source == "Google Maps":
+            result = await asyncio.to_thread(
+                _fetch_outscraper_sync,
+                "https://api.outscraper.cloud/google-maps-reviews",
+                {"query": outscraper_url, "reviewsLimit": 50, "async": "false"},
+                OUTSCRAPER_API_KEY,
+            )
+        else:
+            result = await asyncio.to_thread(
+                _fetch_outscraper_sync,
+                "https://api.outscraper.cloud/booking-reviews",
+                {"query": outscraper_url, "limit": 50, "async": "false"},
+                OUTSCRAPER_API_KEY,
+            )
+
+        if result.get("status") != "Success":
+            logger.error(f"Outscraper returned non-success for client {client_id}: {result.get('status')}")
+            return
+
+        reviews_to_insert = []
+        print("Outscraper result:", json.dumps(result, indent=2))  # Debug log
+        print("Source detected:", source)  # Debug log
+        if source == "Google Maps":
+            for place in result.get("data", []):
+                for rev in place.get("reviews_data", []):
+                    text = (rev.get("review_text") or "").strip()
+                    if not text:
+                        continue
+                    external_id = f"{rev.get('author_id', '')}_{rev.get('review_timestamp', '')}"
+                    existing = await db.reviews.find_one({"client_id": client_id, "external_id": external_id})
+                    if existing:
+                        continue
+                    try:
+                        created_at = datetime.strptime(rev["review_datetime_utc"], "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc).isoformat()
+                    except Exception:
+                        created_at = datetime.now(timezone.utc).isoformat()
+                    reviews_to_insert.append({
+                        "id": str(uuid.uuid4()),
+                        "client_id": client_id,
+                        "source": "Google Maps",
+                        "rating": int(rev.get("review_rating", 5)),
+                        "text": text,
+                        "author": rev.get("author_title", "Anonymous"),
+                        "external_id": external_id,
+                        "created_at": created_at,
+                    })
+
+        else:  # Booking.com
+            for batch in result.get("data", []):
+                items = batch if isinstance(batch, list) else [batch]
+                for rev in items:
+                    liked = (rev.get("review_liked_text") or "").strip()
+                    disliked = (rev.get("review_disliked_text") or "").strip()
+                    text = liked
+                    if liked and disliked:
+                        text = f"{liked}\n\nDisliked: {disliked}"
+                    elif disliked:
+                        text = disliked
+                    if not text:
+                        continue
+                    external_id = rev.get("review_id", "")
+                    if external_id:
+                        existing = await db.reviews.find_one({"client_id": client_id, "external_id": external_id})
+                        if existing:
+                            continue
+                    raw = float(rev.get("review_score", 0))
+                    if raw > 10:
+                        raw = raw / 10
+                    rating = max(1, min(5, round(raw / 2)))
+                    reviews_to_insert.append({
+                        "id": str(uuid.uuid4()),
+                        "client_id": client_id,
+                        "source": "Booking.com",
+                        "rating": rating,
+                        "text": text,
+                        "author": rev.get("author_title", "Anonymous"),
+                        "external_id": external_id,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    })
+        print("Reviews to insert:", len(reviews_to_insert), reviews_to_insert)  # Debug log
+        if reviews_to_insert:
+            await db.reviews.insert_many(reviews_to_insert)
+            logger.info(f"Imported {len(reviews_to_insert)} {source} reviews for client {client_id}")
+        else:
+            logger.info(f"No new reviews to import for client {client_id}")
+
+    except Exception as e:
+        logger.error(f"Outscraper import failed for client {client_id}: {e}")
+
 # ===================== PYDANTIC MODELS =====================
 
 class LoginRequest(BaseModel):
@@ -147,11 +263,13 @@ class CreateClientRequest(BaseModel):
     category: str = "General"
     city: str = ""
     redirect_url: str = ""
+    outscraper_url: str = ""
     is_active: bool = True
 
 class UpdateRedirectRequest(BaseModel):
     redirect_url: str
     is_active: Optional[bool] = None
+    outscraper_url: Optional[str] = None
 
 class MagicWriteRequest(BaseModel):
     member_name: str
@@ -289,7 +407,7 @@ async def admin_list_clients(user: dict = Depends(require_role("super_admin"))):
     return clients
 
 @api_router.post("/admin/clients")
-async def admin_create_client(req: CreateClientRequest, user: dict = Depends(require_role("super_admin"))):
+async def admin_create_client(req: CreateClientRequest, background_tasks: BackgroundTasks, user: dict = Depends(require_role("super_admin"))):
     client_id = str(uuid.uuid4())
     standee_id = f"A{str(uuid.uuid4())[:6].upper()}"
     existing = await db.users.find_one({"email": req.email.lower().strip()})
@@ -297,9 +415,11 @@ async def admin_create_client(req: CreateClientRequest, user: dict = Depends(req
         raise HTTPException(status_code=400, detail="Email already exists")
     user_doc = {"email": req.email.lower().strip(), "password_hash": hash_password(req.password), "name": req.contact_name, "role": "client", "client_id": client_id, "created_at": datetime.now(timezone.utc).isoformat()}
     await db.users.insert_one(user_doc)
-    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "is_active": req.is_active, "created_by": user["_id"], "created_at": datetime.now(timezone.utc).isoformat()}
+    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "outscraper_url": req.outscraper_url or "", "is_active": req.is_active, "created_by": user["_id"], "created_at": datetime.now(timezone.utc).isoformat()}
     await db.clients.insert_one(client_doc)
     await log_audit(user["_id"], user.get("name", "Admin"), "created_client", f"Created client '{req.business_name}' (Standee: {standee_id})")
+    if req.outscraper_url:
+        background_tasks.add_task(import_outscraper_reviews, client_id, req.outscraper_url)
     return {k: v for k, v in client_doc.items() if k != "_id"}
 
 @api_router.put("/admin/clients/{client_id}")
@@ -307,6 +427,8 @@ async def admin_update_client(client_id: str, req: UpdateRedirectRequest, user: 
     update = {"redirect_url": req.redirect_url}
     if req.is_active is not None:
         update["is_active"] = req.is_active
+    if req.outscraper_url is not None:
+        update["outscraper_url"] = req.outscraper_url
     result = await db.clients.update_one({"id": client_id}, {"$set": update})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Client not found")
@@ -437,6 +559,7 @@ class AgentCreateClientRequest(BaseModel):
     category: str = "General"
     city: str = ""
     redirect_url: str = ""
+    outscraper_url: str = ""
 
 @api_router.get("/agent/clients")
 async def agent_list_clients(user: dict = Depends(require_role("sales_agent"))):
@@ -444,7 +567,7 @@ async def agent_list_clients(user: dict = Depends(require_role("sales_agent"))):
     return clients
 
 @api_router.post("/agent/clients")
-async def agent_create_client(req: AgentCreateClientRequest, user: dict = Depends(require_role("sales_agent"))):
+async def agent_create_client(req: AgentCreateClientRequest, background_tasks: BackgroundTasks, user: dict = Depends(require_role("sales_agent"))):
     existing = await db.users.find_one({"email": req.email.lower().strip()})
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
@@ -452,9 +575,11 @@ async def agent_create_client(req: AgentCreateClientRequest, user: dict = Depend
     standee_id = f"A{str(uuid.uuid4())[:6].upper()}"
     user_doc = {"email": req.email.lower().strip(), "password_hash": hash_password(req.password), "name": req.contact_name, "role": "client", "client_id": client_id, "created_at": datetime.now(timezone.utc).isoformat()}
     await db.users.insert_one(user_doc)
-    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "is_active": True, "created_by": user["_id"], "region": user.get("region", ""), "created_at": datetime.now(timezone.utc).isoformat()}
+    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "outscraper_url": req.outscraper_url or "", "is_active": True, "created_by": user["_id"], "region": user.get("region", ""), "created_at": datetime.now(timezone.utc).isoformat()}
     await db.clients.insert_one(client_doc)
     await log_audit(user["_id"], user.get("name", "Agent"), "created_client", f"Agent '{user.get('name')}' created client '{req.business_name}' (Standee: {standee_id})")
+    if req.outscraper_url:
+        background_tasks.add_task(import_outscraper_reviews, client_id, req.outscraper_url)
     return {k: v for k, v in client_doc.items() if k != "_id"}
 
 @api_router.get("/agent/clients/{client_id}")
@@ -557,7 +682,7 @@ async def rep_list_clients(request: Request):
     return clients
 
 @api_router.post("/rep/wizard/create-client")
-async def rep_create_client(req: AgentCreateClientRequest, request: Request):
+async def rep_create_client(req: AgentCreateClientRequest, background_tasks: BackgroundTasks, request: Request):
     user = await get_current_user(request)
     if user["role"] not in ("sales_agent", "account_rep"):
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -568,9 +693,11 @@ async def rep_create_client(req: AgentCreateClientRequest, request: Request):
     standee_id = f"A{str(uuid.uuid4())[:6].upper()}"
     user_doc = {"email": req.email.lower().strip(), "password_hash": hash_password(req.password), "name": req.contact_name, "role": "client", "client_id": client_id, "created_at": datetime.now(timezone.utc).isoformat()}
     await db.users.insert_one(user_doc)
-    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "is_active": True, "created_by": user["_id"], "region": user.get("region", ""), "created_at": datetime.now(timezone.utc).isoformat()}
+    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "outscraper_url": req.outscraper_url or "", "is_active": True, "created_by": user["_id"], "region": user.get("region", ""), "created_at": datetime.now(timezone.utc).isoformat()}
     await db.clients.insert_one(client_doc)
     await log_audit(user["_id"], user.get("name", "Agent"), "created_client", f"Agent '{user.get('name')}' created client '{req.business_name}' (Standee: {standee_id})")
+    if req.outscraper_url:
+        background_tasks.add_task(import_outscraper_reviews, client_id, req.outscraper_url)
     return {k: v for k, v in client_doc.items() if k != "_id"}
 
 @api_router.post("/rep/wizard/upload-staff/{client_id}")
@@ -607,6 +734,32 @@ async def rep_test_redirect(client_id: str, request: Request):
     members = await db.team_members.find({"client_id": client_id}, {"_id": 0}).to_list(100)
     return {"client": client_doc, "members": members, "standee_id": client_doc.get("standee_id", ""), "redirect_works": True}
 
+# Re-import endpoints
+@api_router.post("/admin/clients/{client_id}/import-reviews")
+async def admin_import_reviews(client_id: str, background_tasks: BackgroundTasks, user: dict = Depends(require_role("super_admin"))):
+    client_doc = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not client_doc:
+        raise HTTPException(status_code=404, detail="Client not found")
+    redirect_url = client_doc.get("redirect_url", "")
+    if not redirect_url:
+        raise HTTPException(status_code=400, detail="No redirect URL configured for this client")
+    await db.reviews.delete_many({"client_id": client_id, "source": {"$in": ["Google Maps", "Booking.com"]}})
+    background_tasks.add_task(import_outscraper_reviews, client_id, redirect_url)
+    return {"message": "Review import started"}
+
+@api_router.post("/client/import-reviews")
+async def client_import_reviews(background_tasks: BackgroundTasks, user: dict = Depends(require_role("client"))):
+    client_id = user.get("client_id")
+    client_doc = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not client_doc:
+        raise HTTPException(status_code=404, detail="Client not found")
+    redirect_url = client_doc.get("redirect_url", "")
+    if not redirect_url:
+        raise HTTPException(status_code=400, detail="No redirect URL configured")
+    await db.reviews.delete_many({"client_id": client_id, "source": {"$in": ["Google Maps", "Booking.com"]}})
+    background_tasks.add_task(import_outscraper_reviews, client_id, redirect_url)
+    return {"message": "Review import started"}
+
 # ===================== CLIENT ROUTES =====================
 
 @api_router.get("/client/profile")
@@ -637,11 +790,11 @@ async def client_reviews(user: dict = Depends(require_role("client"))):
     reviews = await db.reviews.find({"client_id": client_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
     if not reviews:
         reviews = [
-            {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Google Maps", "rating": 5, "text": "Amazing service! Dr. Smith was very professional and caring.", "author": "John D.", "created_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()},
-            {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Google Maps", "rating": 4, "text": "Very clean facility and friendly staff. Highly recommend!", "author": "Sarah M.", "created_at": (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()},
-            {"id": str(uuid.uuid4()), "client_id": client_id, "source": "2GIS", "rating": 5, "text": "Best experience I've had. The team is wonderful.", "author": "Alex K.", "created_at": (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()},
-            {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Yelp", "rating": 5, "text": "Efficient and painless. Will definitely come back.", "author": "Maria L.", "created_at": (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()},
-            {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Google Maps", "rating": 3, "text": "Good service but long wait times.", "author": "Chris P.", "created_at": (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()},
+            # {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Google Maps", "rating": 5, "text": "Amazing service! Dr. Smith was very professional and caring.", "author": "John D.", "created_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()},
+            # {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Google Maps", "rating": 4, "text": "Very clean facility and friendly staff. Highly recommend!", "author": "Sarah M.", "created_at": (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()},
+            # {"id": str(uuid.uuid4()), "client_id": client_id, "source": "2GIS", "rating": 5, "text": "Best experience I've had. The team is wonderful.", "author": "Alex K.", "created_at": (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()},
+            # {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Yelp", "rating": 5, "text": "Efficient and painless. Will definitely come back.", "author": "Maria L.", "created_at": (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()},
+            # {"id": str(uuid.uuid4()), "client_id": client_id, "source": "Google Maps", "rating": 3, "text": "Good service but long wait times.", "author": "Chris P.", "created_at": (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()},
         ]
     return reviews
 
