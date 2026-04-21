@@ -20,6 +20,9 @@ from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -117,6 +120,169 @@ async def log_audit(user_id: str, user_name: str, action: str, details: str):
         "action": action, "details": details, "timestamp": datetime.now(timezone.utc).isoformat()
     }
     await db.audit_logs.insert_one(audit_doc)
+
+# Email helper
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", "noreply@tellvy.com")
+
+def send_email_sync(to_email: str, subject: str, html_body: str, plain_body: str = None):
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        logger.warning(f"Email credentials not configured - skipping email to {to_email}")
+        return
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM_EMAIL
+        msg["To"] = to_email
+        
+        if plain_body:
+            msg.attach(MIMEText(plain_body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+        
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM_EMAIL, to_email, msg.as_string())
+        logger.info(f"Email sent to {to_email}")
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {e}")
+
+async def send_email(to_email: str, subject: str, html_body: str, plain_body: str = None):
+    await asyncio.to_thread(send_email_sync, to_email, subject, html_body, plain_body)
+
+def get_client_invitation_email(business_name: str, email: str, password: str, login_url: str = "https://tellvy.app/login"):
+    plain_body = f"""
+Dear valued client,
+
+You have been invited to join Tellvy! Your account has been created for {business_name}.
+
+Login Credentials:
+Email: {email}
+Password: {password}
+
+Please log in at: {login_url}
+
+We're excited to have you on board!
+
+Best regards,
+The Tellvy Team
+"""
+    
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f9f9f9; }}
+        .header {{ background-color: #002FA7; color: white; padding: 20px; text-align: center; border-radius: 5px; }}
+        .content {{ background-color: white; padding: 20px; margin-top: 20px; border-radius: 5px; }}
+        .credentials {{ background-color: #f0f0f0; padding: 15px; border-left: 4px solid #002FA7; margin: 20px 0; }}
+        .button {{ display: inline-block; background-color: #002FA7; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin-top: 20px; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Welcome to Tellvy!</h1>
+        </div>
+        <div class="content">
+            <p>Dear valued client,</p>
+            <p>You have been invited to join Tellvy! Your account has been created for <strong>{business_name}</strong>.</p>
+            
+            <div class="credentials">
+                <p><strong>Login Credentials:</strong></p>
+                <p>Email: <strong>{email}</strong></p>
+                <p>Password: <strong>{password}</strong></p>
+            </div>
+            
+            <p>
+                <a href="{login_url}" class="button">Login to Your Account</a>
+            </p>
+            
+            <p>We're excited to have you on board!</p>
+            <p>Best regards,<br>The Tellvy Team</p>
+        </div>
+        <div class="footer">
+            <p>This is an automated message. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    return html_body, plain_body
+
+def get_staff_invitation_email(name: str, email: str, password: str, role: str, region: str, login_url: str = "https://tellvy.app/login"):
+    role_label = "Regional Manager" if role == "regional_manager" else "Sales Agent"
+    plain_body = f"""
+Dear {name},
+
+You have been invited to join Tellvy as a {role_label}!
+
+Your Account Details:
+Email: {email}
+Password: {password}
+Role: {role_label}
+Region: {region if region else "Not assigned"}
+
+Please log in at: {login_url}
+
+If you have any questions, please contact your administrator.
+
+Best regards,
+The Tellvy Team
+"""
+    
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f9f9f9; }}
+        .header {{ background-color: #002FA7; color: white; padding: 20px; text-align: center; border-radius: 5px; }}
+        .content {{ background-color: white; padding: 20px; margin-top: 20px; border-radius: 5px; }}
+        .credentials {{ background-color: #f0f0f0; padding: 15px; border-left: 4px solid #002FA7; margin: 20px 0; }}
+        .button {{ display: inline-block; background-color: #002FA7; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin-top: 20px; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Welcome to Tellvy!</h1>
+        </div>
+        <div class="content">
+            <p>Dear {name},</p>
+            <p>You have been invited to join Tellvy as a <strong>{role_label}</strong>!</p>
+            
+            <div class="credentials">
+                <p><strong>Your Account Details:</strong></p>
+                <p>Email: <strong>{email}</strong></p>
+                <p>Password: <strong>{password}</strong></p>
+                <p>Role: <strong>{role_label}</strong></p>
+                <p>Region: <strong>{region if region else "Not assigned"}</strong></p>
+            </div>
+            
+            <p>
+                <a href="{login_url}" class="button">Login to Your Account</a>
+            </p>
+            
+            <p>If you have any questions, please contact your administrator.</p>
+            <p>Best regards,<br>The Tellvy Team</p>
+        </div>
+        <div class="footer">
+            <p>This is an automated message. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    return html_body, plain_body
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -426,6 +592,11 @@ async def admin_create_client(req: CreateClientRequest, background_tasks: Backgr
     client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "region": req.region, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "outscraper_url": req.outscraper_url or "", "is_active": req.is_active, "created_by": user["_id"], "created_at": datetime.now(timezone.utc).isoformat()}
     await db.clients.insert_one(client_doc)
     await log_audit(user["_id"], user.get("name", "Admin"), "created_client", f"Created client '{req.business_name}' (Standee: {standee_id})")
+    
+    # Send invitation email
+    html_body, plain_body = get_client_invitation_email(req.business_name, req.email.lower().strip(), req.password)
+    background_tasks.add_task(send_email_sync, req.email.lower().strip(), "Welcome to Tellvy - Your Account Details", html_body, plain_body)
+    
     if req.outscraper_url:
         background_tasks.add_task(import_outscraper_reviews, client_id, req.outscraper_url)
     return {k: v for k, v in client_doc.items() if k != "_id"}
@@ -484,7 +655,7 @@ async def toggle_kill_switch(client_id: str, user: dict = Depends(require_role("
     return {"is_active": new_status}
 
 @api_router.post("/admin/staff")
-async def admin_create_staff(req: CreateStaffRequest, user: dict = Depends(require_role("super_admin"))):
+async def admin_create_staff(req: CreateStaffRequest, user: dict = Depends(require_role("super_admin")), background_tasks: BackgroundTasks = BackgroundTasks()):
     existing = await db.users.find_one({"email": req.email.lower().strip()})
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
@@ -495,6 +666,11 @@ async def admin_create_staff(req: CreateStaffRequest, user: dict = Depends(requi
     rid = str(result.inserted_id)
     label = "Sales Agent" if req.role == "sales_agent" else "Regional Manager"
     await log_audit(user["_id"], user.get("name", "Admin"), f"created_{req.role}", f"Created {label} '{req.name}' in region '{req.region}'")
+    
+    # Send invitation email
+    html_body, plain_body = get_staff_invitation_email(req.name, req.email.lower().strip(), req.password, req.role, req.region)
+    background_tasks.add_task(send_email_sync, req.email.lower().strip(), f"Welcome to Tellvy - {label} Account Details", html_body, plain_body)
+    
     return {"id": rid, "email": req.email.lower().strip(), "name": req.name, "role": req.role, "region": req.region}
 
 @api_router.get("/admin/staff")
