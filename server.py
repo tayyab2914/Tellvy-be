@@ -262,6 +262,7 @@ class CreateClientRequest(BaseModel):
     contact_name: str
     category: str = "General"
     city: str = ""
+    region: str = ""
     redirect_url: str = ""
     outscraper_url: str = ""
     is_active: bool = True
@@ -275,6 +276,7 @@ class UpdateClientRequest(BaseModel):
     business_name: Optional[str] = None
     category: Optional[str] = None
     city: Optional[str] = None
+    region: Optional[str] = None
     redirect_url: Optional[str] = None
 
 class MagicWriteRequest(BaseModel):
@@ -421,7 +423,7 @@ async def admin_create_client(req: CreateClientRequest, background_tasks: Backgr
         raise HTTPException(status_code=400, detail="Email already exists")
     user_doc = {"email": req.email.lower().strip(), "password_hash": hash_password(req.password), "name": req.contact_name, "role": "client", "client_id": client_id, "created_at": datetime.now(timezone.utc).isoformat()}
     await db.users.insert_one(user_doc)
-    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "outscraper_url": req.outscraper_url or "", "is_active": req.is_active, "created_by": user["_id"], "created_at": datetime.now(timezone.utc).isoformat()}
+    client_doc = {"id": client_id, "business_name": req.business_name, "email": req.email.lower().strip(), "contact_name": req.contact_name, "category": req.category, "city": req.city, "region": req.region, "standee_id": standee_id, "redirect_url": req.redirect_url or "", "outscraper_url": req.outscraper_url or "", "is_active": req.is_active, "created_by": user["_id"], "created_at": datetime.now(timezone.utc).isoformat()}
     await db.clients.insert_one(client_doc)
     await log_audit(user["_id"], user.get("name", "Admin"), "created_client", f"Created client '{req.business_name}' (Standee: {standee_id})")
     if req.outscraper_url:
@@ -442,6 +444,8 @@ async def admin_update_client(client_id: str, req: UpdateClientRequest, backgrou
         update["category"] = req.category
     if req.city is not None:
         update["city"] = req.city
+    if req.region is not None:
+        update["region"] = req.region
     if req.redirect_url is not None:
         update["redirect_url"] = req.redirect_url
     
