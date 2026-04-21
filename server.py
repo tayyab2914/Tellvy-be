@@ -127,7 +127,7 @@ def _detect_source(url: str) -> str:
     lower = url.lower()
     if "booking.com" in lower:
         return "Booking.com"
-    if "google.com/maps" in lower or "maps.google" in lower or "goo.gl/maps" in lower or "maps.app.goo.gl" in lower:
+    if "google.com/maps" in lower or "maps.google" in lower or "goo.gl/maps" in lower:
         return "Google Maps"
     return ""
 
@@ -270,6 +270,12 @@ class UpdateRedirectRequest(BaseModel):
     redirect_url: str
     is_active: Optional[bool] = None
     outscraper_url: Optional[str] = None
+
+class UpdateClientRequest(BaseModel):
+    business_name: Optional[str] = None
+    category: Optional[str] = None
+    city: Optional[str] = None
+    redirect_url: Optional[str] = None
 
 class MagicWriteRequest(BaseModel):
     member_name: str
@@ -423,15 +429,33 @@ async def admin_create_client(req: CreateClientRequest, background_tasks: Backgr
     return {k: v for k, v in client_doc.items() if k != "_id"}
 
 @api_router.put("/admin/clients/{client_id}")
-async def admin_update_client(client_id: str, req: UpdateRedirectRequest, user: dict = Depends(require_role("super_admin"))):
-    update = {"redirect_url": req.redirect_url}
-    if req.is_active is not None:
-        update["is_active"] = req.is_active
-    if req.outscraper_url is not None:
-        update["outscraper_url"] = req.outscraper_url
+async def admin_update_client(client_id: str, req: UpdateClientRequest, background_tasks: BackgroundTasks, user: dict = Depends(require_role("super_admin"))):
+    # Get existing client to check if redirect_url changed
+    existing_client = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not existing_client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    
+    update = {}
+    if req.business_name is not None:
+        update["business_name"] = req.business_name
+    if req.category is not None:
+        update["category"] = req.category
+    if req.city is not None:
+        update["city"] = req.city
+    if req.redirect_url is not None:
+        update["redirect_url"] = req.redirect_url
+    
     result = await db.clients.update_one({"id": client_id}, {"$set": update})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Client not found")
+    
+    # Check if redirect_url changed and trigger import
+    old_redirect = existing_client.get("redirect_url", "")
+    new_redirect = req.redirect_url if req.redirect_url is not None else old_redirect
+    if new_redirect and new_redirect != old_redirect:
+        background_tasks.add_task(import_outscraper_reviews, client_id, new_redirect)
+    
+    await log_audit(user["_id"], user.get("name", "Admin"), "updated_client", f"Updated client '{client_id}'")
     return {"message": "Updated"}
 
 @api_router.delete("/admin/clients/{client_id}")
