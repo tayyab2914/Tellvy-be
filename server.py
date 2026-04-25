@@ -284,6 +284,63 @@ The Tellvy Team
 """
     return html_body, plain_body
 
+def get_low_rating_alert_email(business_name: str, member_name: str, rating: int):
+    filled = "★" * rating
+    empty = "☆" * (5 - rating)
+    plain_body = f"""
+Low Rating Alert — Action Required
+
+Dear {business_name},
+
+A customer has selected {rating} out of 5 stars for {member_name} and is about to leave a review.
+
+Rating: {filled}{empty} ({rating}/5)
+Staff Member: {member_name}
+
+We recommend reaching out to this customer proactively to address any concerns before they publish their review.
+
+Best regards,
+The Tellvy Team
+"""
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f9f9f9; }}
+        .header {{ background-color: #b91c1c; color: white; padding: 20px; text-align: center; border-radius: 5px; }}
+        .header h1 {{ margin: 0; font-size: 20px; }}
+        .content {{ background-color: white; padding: 20px; margin-top: 20px; border-radius: 5px; }}
+        .alert-box {{ background-color: #fef9c3; padding: 15px; border-left: 4px solid #ca8a04; margin: 20px 0; border-radius: 3px; }}
+        .stars {{ font-size: 28px; color: #ca8a04; letter-spacing: 2px; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>&#9888; Low Rating Alert</h1>
+        </div>
+        <div class="content">
+            <p>Dear <strong>{business_name}</strong>,</p>
+            <p>A customer has selected a <strong>low rating</strong> for one of your team members and is about to leave a public review.</p>
+            <div class="alert-box">
+                <p><strong>Staff Member:</strong> {member_name}</p>
+                <p><strong>Rating:</strong> <span class="stars">{filled}{empty}</span> &nbsp;({rating} out of 5 stars)</p>
+            </div>
+            <p>We recommend reaching out to this customer proactively to resolve any concerns before they publish their review.</p>
+            <p>Best regards,<br>The Tellvy Team</p>
+        </div>
+        <div class="footer">
+            <p>This is an automated alert from Tellvy. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    return html_body, plain_body
+
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
@@ -454,6 +511,12 @@ class ResponseAssistRequest(BaseModel):
     review_text: str
     rating: int = 5
     category: str = "General"
+
+class LowRatingAlertRequest(BaseModel):
+    client_id: str
+    member_id: str
+    member_name: str
+    rating: int
 
 # ===================== AUTH ROUTES =====================
 
@@ -1048,6 +1111,23 @@ async def log_intent(data: dict):
     intent_doc = {"id": str(uuid.uuid4()), "client_id": data.get("client_id"), "member_id": data.get("member_id"), "member_name": data.get("member_name", ""), "timestamp": datetime.now(timezone.utc).isoformat(), "status": "intent"}
     await db.intent_logs.insert_one(intent_doc)
     return {k: v for k, v in intent_doc.items() if k != "_id"}
+
+@api_router.post("/portal/low-rating-alert")
+async def low_rating_alert(req: LowRatingAlertRequest, background_tasks: BackgroundTasks):
+    if req.rating >= 4:
+        return {"status": "no_alert_needed"}
+    client_doc = await db.clients.find_one({"id": req.client_id}, {"_id": 0})
+    if not client_doc:
+        raise HTTPException(status_code=404, detail="Client not found")
+    client_email = client_doc.get("email", "")
+    if not client_email:
+        return {"status": "no_email_configured"}
+    business_name = client_doc.get("business_name", "Your Business")
+    html_body, plain_body = get_low_rating_alert_email(business_name, req.member_name, req.rating)
+    subject = f"⚠️ Low Rating Alert — {req.member_name} received {req.rating}/5 stars"
+    background_tasks.add_task(send_email_sync, client_email, subject, html_body, plain_body)
+    logger.info(f"Low rating alert triggered for client {req.client_id}: {req.member_name} got {req.rating} stars")
+    return {"status": "alert_sent"}
 
 # ===================== FILE SERVING =====================
 
