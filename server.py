@@ -1224,10 +1224,6 @@ async def startup():
         logger.info("Object storage initialized")
     except Exception as e:
         logger.error(f"Storage init failed: {e}")
-    # Write test credentials
-    os.makedirs("/app/memory", exist_ok=True)
-    with open("/app/memory/test_credentials.md", "w") as f:
-        f.write(f"# Test Credentials\n\n## Super Admin\n- Email: {admin_email}\n- Password: {admin_password}\n- Role: super_admin\n\n## Roles: super_admin, regional_manager, sales_agent, client\n\n## Key Endpoints\n- POST /api/auth/login\n- POST /api/auth/register\n- GET /api/auth/me\n- POST /api/admin/staff (create sales_agent or regional_manager)\n- GET /api/admin/regions\n- POST /api/admin/regions\n- GET /api/agent/clients\n- POST /api/agent/clients\n- GET /api/regional/stats\n- GET /api/regional/agents\n- GET /api/regional/clients\n")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
