@@ -1231,9 +1231,11 @@ async def shutdown_db_client():
 
 app.include_router(api_router)
 
+_cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "https://tellvy.vercel.app,http://localhost:3000,http://localhost:5173").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https://tellvy.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
