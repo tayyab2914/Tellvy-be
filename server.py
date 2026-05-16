@@ -341,6 +341,77 @@ The Tellvy Team
 """
     return html_body, plain_body
 
+def get_private_feedback_email(business_name: str, member_name: str, rating: int, message: str):
+    rating_line = ""
+    if rating:
+        filled = "★" * rating
+        empty = "☆" * (5 - rating)
+        rating_line = f"Rating: {filled}{empty} ({rating}/5)\n"
+    member_line = f"Staff Member: {member_name}\n" if member_name else ""
+    plain_body = f"""
+Private Customer Feedback
+
+Dear {business_name},
+
+A customer has chosen to send you private feedback directly instead of posting a public review.
+
+{member_line}{rating_line}
+Their message:
+"{message}"
+
+We recommend following up with this customer to resolve their concerns.
+
+Best regards,
+The Tellvy Team
+"""
+    rating_html = ""
+    if rating:
+        filled = "★" * rating
+        empty = "☆" * (5 - rating)
+        rating_html = f'<p><strong>Rating:</strong> <span class="stars">{filled}{empty}</span> &nbsp;({rating} out of 5 stars)</p>'
+    member_html = f"<p><strong>Staff Member:</strong> {member_name}</p>" if member_name else ""
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f9f9f9; }}
+        .header {{ background-color: #002FA7; color: white; padding: 20px; text-align: center; border-radius: 5px; }}
+        .header h1 {{ margin: 0; font-size: 20px; }}
+        .content {{ background-color: white; padding: 20px; margin-top: 20px; border-radius: 5px; }}
+        .alert-box {{ background-color: #eef2ff; padding: 15px; border-left: 4px solid #002FA7; margin: 20px 0; border-radius: 3px; }}
+        .message-box {{ background-color: #f4f4f5; padding: 15px; margin: 20px 0; border-radius: 3px; font-style: italic; }}
+        .stars {{ font-size: 28px; color: #ca8a04; letter-spacing: 2px; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>&#9993; Private Customer Feedback</h1>
+        </div>
+        <div class="content">
+            <p>Dear <strong>{business_name}</strong>,</p>
+            <p>A customer has chosen to send you <strong>private feedback</strong> directly instead of posting a public review.</p>
+            <div class="alert-box">
+                {member_html}
+                {rating_html}
+            </div>
+            <p><strong>Their message:</strong></p>
+            <div class="message-box">{message}</div>
+            <p>We recommend following up with this customer to resolve their concerns.</p>
+            <p>Best regards,<br>The Tellvy Team</p>
+        </div>
+        <div class="footer">
+            <p>This is an automated message from Tellvy. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    return html_body, plain_body
+
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
@@ -506,6 +577,7 @@ class MagicWriteRequest(BaseModel):
     member_name: str
     tags: List[str]
     category: str = "General"
+    rating: int = 5
 
 class ResponseAssistRequest(BaseModel):
     review_text: str
@@ -517,6 +589,13 @@ class LowRatingAlertRequest(BaseModel):
     member_id: str
     member_name: str
     rating: int
+
+class PrivateFeedbackRequest(BaseModel):
+    client_id: str
+    member_id: str = ""
+    member_name: str = ""
+    rating: int = 0
+    message: str
 
 # ===================== AUTH ROUTES =====================
 
@@ -1129,6 +1208,33 @@ async def low_rating_alert(req: LowRatingAlertRequest, background_tasks: Backgro
     logger.info(f"Low rating alert triggered for client {req.client_id}: {req.member_name} got {req.rating} stars")
     return {"status": "alert_sent"}
 
+@api_router.post("/portal/private-feedback")
+async def private_feedback(req: PrivateFeedbackRequest, background_tasks: BackgroundTasks):
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Feedback message is required")
+    client_doc = await db.clients.find_one({"id": req.client_id}, {"_id": 0})
+    if not client_doc:
+        raise HTTPException(status_code=404, detail="Client not found")
+    feedback_doc = {
+        "id": str(uuid.uuid4()),
+        "client_id": req.client_id,
+        "member_id": req.member_id,
+        "member_name": req.member_name,
+        "rating": req.rating,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.private_feedback.insert_one(feedback_doc)
+    business_name = client_doc.get("business_name", "Your Business")
+    client_email = client_doc.get("email", "")
+    if client_email:
+        html_body, plain_body = get_private_feedback_email(business_name, req.member_name, req.rating, message)
+        subject = f"📩 Private Feedback — {business_name}"
+        background_tasks.add_task(send_email_sync, client_email, subject, html_body, plain_body)
+    logger.info(f"Private feedback received for client {req.client_id} ({req.member_name}, {req.rating} stars)")
+    return {"status": "feedback_received"}
+
 # ===================== FILE SERVING =====================
 
 @api_router.get("/files/{path:path}")
@@ -1157,23 +1263,45 @@ async def get_category_tags(category: str):
 
 @api_router.post("/ai/magic-write")
 async def magic_write(req: MagicWriteRequest):
+    is_low = req.rating and req.rating <= 3
     try:
         from google import genai
         from google.genai import types
         gemini = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = f"Write a natural 2-sentence positive Google review mentioning {req.member_name}. The review should touch on these qualities: {', '.join(req.tags)}. Category: {req.category}. Sound authentic and human."
+        if is_low:
+            prompt = (
+                f"Write a natural, honest {req.rating}-star Google review (2-3 sentences) mentioning {req.member_name}. "
+                f"The customer felt these areas fell short of expectations: {', '.join(req.tags)}. "
+                f"Category: {req.category}. The review should be constructive and fair — clearly convey that the "
+                f"experience was below expectations and describe what could be improved. Do NOT write a cheerful or "
+                f"glowing review; it must read as a genuine {req.rating}-star rating."
+            )
+            system_instruction = (
+                "You are a helpful review writer assisting a customer who had a disappointing experience. "
+                "Generate a short, honest, constructive Google review that clearly matches a low (1-3 star) rating. "
+                "Focus on specific areas for improvement in a calm, fair, non-aggressive tone. NEVER write a "
+                "positive or 5-star-style review for a low rating. Keep it to 2-3 sentences. Sound like a real "
+                "customer, not robotic. Do not use quotation marks around the review."
+            )
+        else:
+            prompt = f"Write a natural 2-sentence positive Google review mentioning {req.member_name}. The review should touch on these qualities: {', '.join(req.tags)}. Category: {req.category}. Sound authentic and human."
+            system_instruction = "You are a helpful review writer. Generate short, natural-sounding Google reviews. Keep it to 2 sentences maximum. Sound like a real customer, not robotic. Do not use quotation marks around the review."
         result = await gemini.aio.models.generate_content(
             model="gemini-2.0-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction="You are a helpful review writer. Generate short, natural-sounding Google reviews. Keep it to 2 sentences maximum. Sound like a real customer, not robotic. Do not use quotation marks around the review.",
+                system_instruction=system_instruction,
             ),
         )
         return {"review_draft": result.text, "member_name": req.member_name, "tags": req.tags}
     except Exception as e:
         logger.error(f"AI Magic Write error: {e}")
-        tags_str = " and ".join(req.tags[:2]) if req.tags else "professional"
-        return {"review_draft": f"Had a wonderful experience with {req.member_name}. They were incredibly {tags_str} throughout the entire visit.", "member_name": req.member_name, "tags": req.tags}
+        tags_str = " and ".join(req.tags[:2]) if req.tags else "the service"
+        if is_low:
+            fallback = f"My experience with {req.member_name} did not quite meet my expectations, particularly when it came to {tags_str}. I hope the team can look into this so future visits go more smoothly."
+        else:
+            fallback = f"Had a wonderful experience with {req.member_name}. They were incredibly {tags_str} throughout the entire visit."
+        return {"review_draft": fallback, "member_name": req.member_name, "tags": req.tags}
 
 @api_router.post("/ai/response-assist")
 async def response_assist(req: ResponseAssistRequest):
