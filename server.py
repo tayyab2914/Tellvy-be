@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import json
+import random
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -1261,46 +1262,111 @@ CATEGORY_TAGS = {
 async def get_category_tags(category: str):
     return {"tags": CATEGORY_TAGS.get(category, CATEGORY_TAGS["General"])}
 
+# ----- Review variation -----
+# These rotate per request so the same staff member + tag combination never
+# produces an identical review twice (duplicate reviews look like spam to
+# customers and to Google's spam detection).
+REVIEW_TONES = [
+    "warm and heartfelt", "casual and conversational", "enthusiastic and upbeat",
+    "calm and matter-of-fact", "appreciative and grateful", "friendly and easygoing",
+    "sincere and reflective", "down-to-earth and genuine",
+]
+REVIEW_OPENERS = [
+    "Open by mentioning what brought you in.",
+    "Open by naming the staff member directly.",
+    "Open with your overall impression.",
+    "Open with a specific moment from the visit.",
+    "Open with how you felt afterwards.",
+    "Open with how the experience compared to your expectations.",
+]
+REVIEW_LENGTHS = ["1 short sentence", "2 sentences", "2-3 sentences", "3 sentences"]
+
+LOW_REVIEW_FALLBACKS = [
+    "My experience with {member} fell short of what I expected, particularly around {tags}. I hope the team can address this so future visits go more smoothly.",
+    "Unfortunately my visit with {member} was disappointing — {tags} could really use some attention. I'd like to see improvements here.",
+    "I wanted to share some honest feedback: {member} missed the mark for me when it came to {tags}. There's definitely room to do better.",
+    "Things didn't go as well as I'd hoped with {member}. {tags_cap} left me underwhelmed, and I think this is worth the team looking into.",
+    "My time with {member} was below expectations. I struggled with {tags}, and I hope sharing this helps the team improve.",
+]
+HIGH_REVIEW_FALLBACKS = [
+    "Had a great experience with {member} — genuinely impressed by how {tags} they were throughout. Would happily come back.",
+    "{member_cap} took great care of me from start to finish. The {tags} really stood out and made the whole visit easy.",
+    "Really pleased with my visit. {member_cap} was {tags}, and it made all the difference. Highly recommend stopping by.",
+    "So glad I chose this place. {member_cap} was {tags} and made me feel completely looked after.",
+    "A wonderful experience all around. {member_cap} was {tags}, and I'll definitely be recommending them to friends.",
+]
+
 @api_router.post("/ai/magic-write")
 async def magic_write(req: MagicWriteRequest):
     is_low = req.rating and req.rating <= 3
+    # Per-request variation so the same inputs never yield an identical review.
+    tone = random.choice(REVIEW_TONES)
+    opener = random.choice(REVIEW_OPENERS)
+    length = random.choice(REVIEW_LENGTHS)
+    # Random seed + high temperature break the model's tendency to repeat itself.
+    variation_seed = random.randint(1, 2_000_000_000)
+    temperature = round(random.uniform(1.0, 1.3), 2)
     try:
         from google import genai
         from google.genai import types
         gemini = genai.Client(api_key=GEMINI_API_KEY)
         if is_low:
             prompt = (
-                f"Write a natural, honest {req.rating}-star Google review (2-3 sentences) mentioning {req.member_name}. "
+                f"Write a natural, honest {req.rating}-star Google review ({length}) mentioning {req.member_name}. "
                 f"The customer felt these areas fell short of expectations: {', '.join(req.tags)}. "
-                f"Category: {req.category}. The review should be constructive and fair — clearly convey that the "
-                f"experience was below expectations and describe what could be improved. Do NOT write a cheerful or "
-                f"glowing review; it must read as a genuine {req.rating}-star rating."
+                f"Category: {req.category}. Tone: {tone}. {opener} "
+                f"The review must be constructive and fair — clearly convey that the experience was below "
+                f"expectations and describe what could be improved. Do NOT write a cheerful or glowing review; "
+                f"it must read as a genuine {req.rating}-star rating. "
+                f"Make the wording, structure, and phrasing completely original — it must not resemble any other "
+                f"review. Avoid generic stock phrases. Variation token: {variation_seed}."
             )
             system_instruction = (
                 "You are a helpful review writer assisting a customer who had a disappointing experience. "
                 "Generate a short, honest, constructive Google review that clearly matches a low (1-3 star) rating. "
                 "Focus on specific areas for improvement in a calm, fair, non-aggressive tone. NEVER write a "
-                "positive or 5-star-style review for a low rating. Keep it to 2-3 sentences. Sound like a real "
-                "customer, not robotic. Do not use quotation marks around the review."
+                "positive or 5-star-style review for a low rating. Sound like a real customer, not robotic. "
+                "Every review must be uniquely worded — never repeat sentence structures or phrasing from earlier "
+                "reviews, even for the same inputs. Do not use quotation marks around the review."
             )
         else:
-            prompt = f"Write a natural 2-sentence positive Google review mentioning {req.member_name}. The review should touch on these qualities: {', '.join(req.tags)}. Category: {req.category}. Sound authentic and human."
-            system_instruction = "You are a helpful review writer. Generate short, natural-sounding Google reviews. Keep it to 2 sentences maximum. Sound like a real customer, not robotic. Do not use quotation marks around the review."
+            prompt = (
+                f"Write a natural, positive {req.rating}-star Google review ({length}) mentioning {req.member_name}. "
+                f"The review should touch on these qualities: {', '.join(req.tags)}. "
+                f"Category: {req.category}. Tone: {tone}. {opener} Sound authentic and human. "
+                f"Make the wording, structure, and phrasing completely original — every review must be noticeably "
+                f"different from the last, even for the same qualities. Avoid generic stock phrases such as "
+                f"'highly recommend' unless it genuinely fits. Variation token: {variation_seed}."
+            )
+            system_instruction = (
+                "You are a helpful review writer. Generate short, natural-sounding Google reviews. Sound like a "
+                "real customer, not robotic. Every review must be uniquely worded — never repeat sentence "
+                "structures, openings, or phrasing from earlier reviews, even for identical inputs, so the reviews "
+                "never look duplicated or spammy. Do not use quotation marks around the review."
+            )
         result = await gemini.aio.models.generate_content(
             model="gemini-2.0-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
+                temperature=temperature,
+                top_p=0.95,
+                seed=variation_seed,
             ),
         )
         return {"review_draft": result.text, "member_name": req.member_name, "tags": req.tags}
     except Exception as e:
         logger.error(f"AI Magic Write error: {e}")
+        # Offline fallback: still rotate through varied templates so repeated
+        # failures don't hand out the same canned sentence.
         tags_str = " and ".join(req.tags[:2]) if req.tags else "the service"
-        if is_low:
-            fallback = f"My experience with {req.member_name} did not quite meet my expectations, particularly when it came to {tags_str}. I hope the team can look into this so future visits go more smoothly."
-        else:
-            fallback = f"Had a wonderful experience with {req.member_name}. They were incredibly {tags_str} throughout the entire visit."
+        template = random.choice(LOW_REVIEW_FALLBACKS if is_low else HIGH_REVIEW_FALLBACKS)
+        fallback = template.format(
+            member=req.member_name,
+            member_cap=req.member_name,
+            tags=tags_str,
+            tags_cap=tags_str[:1].upper() + tags_str[1:] if tags_str else tags_str,
+        )
         return {"review_draft": fallback, "member_name": req.member_name, "tags": req.tags}
 
 @api_router.post("/ai/response-assist")
