@@ -82,6 +82,74 @@ def get_object(path: str):
     resp.raise_for_status()
     return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
+# ===================== AWS S3 — STAFF PHOTO STORAGE =====================
+# Staff profile photos are stored in an S3 bucket and served directly from the
+# bucket's public URL (the bucket must have a public-read bucket policy and
+# block-public-access disabled). photo_path stores the full https URL.
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET")
+AWS_S3_REGION = os.environ.get("AWS_S3_REGION", "us-east-1")
+
+_s3_client = None
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+        _s3_client = boto3.client(
+            "s3",
+            region_name=AWS_S3_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        )
+    return _s3_client
+
+def s3_public_url(key: str) -> str:
+    return f"https://{AWS_S3_BUCKET}.s3.{AWS_S3_REGION}.amazonaws.com/{key}"
+
+def s3_upload_sync(key: str, data: bytes, content_type: str) -> str:
+    if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_S3_BUCKET):
+        raise RuntimeError(
+            "AWS S3 is not configured — set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_S3_BUCKET."
+        )
+    s3 = get_s3_client()
+    # No ACL param: modern buckets have ACLs disabled (Bucket owner enforced) and
+    # rely on a bucket policy for public read — passing ACL would error.
+    s3.put_object(
+        Bucket=AWS_S3_BUCKET, Key=key, Body=data,
+        ContentType=content_type, CacheControl="public, max-age=31536000",
+    )
+    return s3_public_url(key)
+
+def s3_delete_sync(key: str):
+    if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_S3_BUCKET):
+        return
+    try:
+        get_s3_client().delete_object(Bucket=AWS_S3_BUCKET, Key=key)
+    except Exception as e:
+        logger.warning(f"S3 delete failed for {key}: {e}")
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}
+
+async def store_staff_photo(client_id: str, file: "UploadFile") -> tuple:
+    """Upload a staff photo to S3. Returns (public_url, s3_key); raises HTTPException on failure."""
+    content_type = (file.content_type or "image/jpeg").lower()
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported image type. Please use JPG, PNG, WEBP or GIF.")
+    ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "jpg"
+    key = f"{APP_NAME}/staff/{client_id}/{uuid.uuid4()}.{ext}"
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    try:
+        return await asyncio.to_thread(s3_upload_sync, key, data, content_type), key
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"S3 staff photo upload failed: {e}")
+        raise HTTPException(status_code=502, detail="Image upload failed. Please try again.")
+
 # Auth helper
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
@@ -954,17 +1022,9 @@ async def agent_upload_staff(client_id: str, file: UploadFile = File(...), name:
     client_doc = await db.clients.find_one({"id": client_id, "created_by": user["_id"]})
     if not client_doc:
         raise HTTPException(status_code=404, detail="Client not found or not yours")
-    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    storage_path = f"{APP_NAME}/staff/{client_id}/{uuid.uuid4()}.{ext}"
-    data = await file.read()
-    try:
-        result = put_object(storage_path, data, file.content_type or "image/jpeg")
-        stored_path = result.get("path", storage_path)
-    except Exception as e:
-        logger.error(f"Storage upload failed: {e}")
-        stored_path = storage_path
+    photo_url, photo_key = await store_staff_photo(client_id, file)
     member_id = str(uuid.uuid4())
-    member_doc = {"id": member_id, "client_id": client_id, "name": name, "role_title": role_title, "photo_path": stored_path, "original_filename": file.filename, "content_type": file.content_type, "created_at": datetime.now(timezone.utc).isoformat()}
+    member_doc = {"id": member_id, "client_id": client_id, "name": name, "role_title": role_title, "photo_path": photo_url, "photo_key": photo_key, "original_filename": file.filename, "content_type": file.content_type, "created_at": datetime.now(timezone.utc).isoformat()}
     await db.team_members.insert_one(member_doc)
     await log_audit(user["_id"], user.get("name", "Agent"), "uploaded_staff", f"Agent '{user.get('name')}' uploaded staff '{name}' for '{client_doc.get('business_name')}'")
     return {k: v for k, v in member_doc.items() if k != "_id"}
@@ -985,6 +1045,29 @@ async def agent_update_member(client_id: str, member_id: str, data: dict, reques
     if update:
         await db.team_members.update_one({"id": member_id, "client_id": client_id}, {"$set": update})
     return {"message": "Updated"}
+
+@api_router.post("/agent/clients/{client_id}/team/{member_id}/photo")
+async def agent_replace_member_photo(client_id: str, member_id: str, file: UploadFile = File(...), request: Request = None):
+    user = await get_current_user(request)
+    if user["role"] != "sales_agent":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    client_doc = await db.clients.find_one({"id": client_id, "created_by": user["_id"]})
+    if not client_doc:
+        raise HTTPException(status_code=404, detail="Client not found or not yours")
+    member = await db.team_members.find_one({"id": member_id, "client_id": client_id})
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    photo_url, photo_key = await store_staff_photo(client_id, file)
+    old_key = member.get("photo_key")
+    await db.team_members.update_one(
+        {"id": member_id, "client_id": client_id},
+        {"$set": {"photo_path": photo_url, "photo_key": photo_key, "original_filename": file.filename, "content_type": file.content_type}},
+    )
+    # Best-effort cleanup of the replaced image so the bucket doesn't accumulate orphans.
+    if old_key and old_key != photo_key:
+        await asyncio.to_thread(s3_delete_sync, old_key)
+    await log_audit(user["_id"], user.get("name", "Agent"), "updated_staff_photo", f"Agent '{user.get('name')}' updated photo for staff '{member.get('name')}' at '{client_doc.get('business_name')}'")
+    return {"photo_path": photo_url}
 
 @api_router.delete("/agent/clients/{client_id}/team/{member_id}")
 async def agent_delete_member(client_id: str, member_id: str, request: Request = None):
@@ -1055,17 +1138,9 @@ async def rep_upload_staff(client_id: str, file: UploadFile = File(...), name: s
     client_doc = await db.clients.find_one({"id": client_id})
     if not client_doc:
         raise HTTPException(status_code=404, detail="Client not found")
-    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    storage_path = f"{APP_NAME}/staff/{client_id}/{uuid.uuid4()}.{ext}"
-    data = await file.read()
-    try:
-        result = put_object(storage_path, data, file.content_type or "image/jpeg")
-        stored_path = result.get("path", storage_path)
-    except Exception as e:
-        logger.error(f"Storage upload failed: {e}")
-        stored_path = storage_path
+    photo_url, photo_key = await store_staff_photo(client_id, file)
     member_id = str(uuid.uuid4())
-    member_doc = {"id": member_id, "client_id": client_id, "name": name, "role_title": role_title, "photo_path": stored_path, "original_filename": file.filename, "content_type": file.content_type, "created_at": datetime.now(timezone.utc).isoformat()}
+    member_doc = {"id": member_id, "client_id": client_id, "name": name, "role_title": role_title, "photo_path": photo_url, "photo_key": photo_key, "original_filename": file.filename, "content_type": file.content_type, "created_at": datetime.now(timezone.utc).isoformat()}
     await db.team_members.insert_one(member_doc)
     await log_audit(user["_id"], user.get("name", "Agent"), "uploaded_staff", f"Agent '{user.get('name')}' uploaded staff '{name}' for '{client_doc.get('business_name')}'")
     return {k: v for k, v in member_doc.items() if k != "_id"}
@@ -1151,19 +1226,30 @@ async def client_add_member(file: UploadFile = File(...), name: str = "", role_t
     if user["role"] != "client":
         raise HTTPException(status_code=403, detail="Not authorized")
     client_id = user.get("client_id")
-    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    storage_path = f"{APP_NAME}/staff/{client_id}/{uuid.uuid4()}.{ext}"
-    data = await file.read()
-    try:
-        result = put_object(storage_path, data, file.content_type or "image/jpeg")
-        stored_path = result.get("path", storage_path)
-    except Exception as e:
-        logger.error(f"Storage upload failed: {e}")
-        stored_path = storage_path
+    photo_url, photo_key = await store_staff_photo(client_id, file)
     member_id = str(uuid.uuid4())
-    member_doc = {"id": member_id, "client_id": client_id, "name": name, "role_title": role_title, "photo_path": stored_path, "original_filename": file.filename, "content_type": file.content_type, "created_at": datetime.now(timezone.utc).isoformat()}
+    member_doc = {"id": member_id, "client_id": client_id, "name": name, "role_title": role_title, "photo_path": photo_url, "photo_key": photo_key, "original_filename": file.filename, "content_type": file.content_type, "created_at": datetime.now(timezone.utc).isoformat()}
     await db.team_members.insert_one(member_doc)
     return {k: v for k, v in member_doc.items() if k != "_id"}
+
+@api_router.post("/client/team/{member_id}/photo")
+async def client_replace_member_photo(member_id: str, file: UploadFile = File(...), request: Request = None):
+    user = await get_current_user(request)
+    if user["role"] != "client":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    client_id = user.get("client_id")
+    member = await db.team_members.find_one({"id": member_id, "client_id": client_id})
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    photo_url, photo_key = await store_staff_photo(client_id, file)
+    old_key = member.get("photo_key")
+    await db.team_members.update_one(
+        {"id": member_id, "client_id": client_id},
+        {"$set": {"photo_path": photo_url, "photo_key": photo_key, "original_filename": file.filename, "content_type": file.content_type}},
+    )
+    if old_key and old_key != photo_key:
+        await asyncio.to_thread(s3_delete_sync, old_key)
+    return {"photo_path": photo_url}
 
 # ===================== PUBLIC NFC/REDIRECT ROUTES =====================
 
@@ -1299,6 +1385,10 @@ HIGH_REVIEW_FALLBACKS = [
 @api_router.post("/ai/magic-write")
 async def magic_write(req: MagicWriteRequest):
     is_low = req.rating and req.rating <= 3
+    # Inject the selected tag words entirely in lowercase so they read naturally
+    # inside a sentence (e.g. "they were gentle and professional") instead of
+    # appearing as awkward capitalised words mid-review.
+    tags_lower = [t.lower().strip() for t in req.tags if t and t.strip()]
     # Per-request variation so the same inputs never yield an identical review.
     tone = random.choice(REVIEW_TONES)
     opener = random.choice(REVIEW_OPENERS)
@@ -1313,7 +1403,8 @@ async def magic_write(req: MagicWriteRequest):
         if is_low:
             prompt = (
                 f"Write a natural, honest {req.rating}-star Google review ({length}) mentioning {req.member_name}. "
-                f"The customer felt these areas fell short of expectations: {', '.join(req.tags)}. "
+                f"The customer felt these areas fell short of expectations: {', '.join(tags_lower)}. "
+                f"Always write those words in lowercase within the sentence so they read naturally. "
                 f"Category: {req.category}. Tone: {tone}. {opener} "
                 f"The review must be constructive and fair — clearly convey that the experience was below "
                 f"expectations and describe what could be improved. Do NOT write a cheerful or glowing review; "
@@ -1332,7 +1423,8 @@ async def magic_write(req: MagicWriteRequest):
         else:
             prompt = (
                 f"Write a natural, positive {req.rating}-star Google review ({length}) mentioning {req.member_name}. "
-                f"The review should touch on these qualities: {', '.join(req.tags)}. "
+                f"The review should touch on these qualities: {', '.join(tags_lower)}. "
+                f"Always write those quality words in lowercase within the sentence so they read naturally. "
                 f"Category: {req.category}. Tone: {tone}. {opener} Sound authentic and human. "
                 f"Make the wording, structure, and phrasing completely original — every review must be noticeably "
                 f"different from the last, even for the same qualities. Avoid generic stock phrases such as "
@@ -1359,7 +1451,7 @@ async def magic_write(req: MagicWriteRequest):
         logger.error(f"AI Magic Write error: {e}")
         # Offline fallback: still rotate through varied templates so repeated
         # failures don't hand out the same canned sentence.
-        tags_str = " and ".join(req.tags[:2]) if req.tags else "the service"
+        tags_str = " and ".join(tags_lower[:2]) if tags_lower else "the service"
         template = random.choice(LOW_REVIEW_FALLBACKS if is_low else HIGH_REVIEW_FALLBACKS)
         fallback = template.format(
             member=req.member_name,
