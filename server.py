@@ -1244,6 +1244,12 @@ async def client_reviews(user: dict = Depends(require_role("client"))):
         ]
     return reviews
 
+@api_router.get("/client/private-feedback")
+async def client_private_feedback(user: dict = Depends(require_role("client"))):
+    client_id = user.get("client_id")
+    feedback = await db.private_feedback.find({"client_id": client_id}, {"_id": 0}).sort("timestamp", -1).to_list(200)
+    return feedback
+
 @api_router.post("/client/team")
 async def client_add_member(file: UploadFile = File(...), name: str = "", role_title: str = "", request: Request = None):
     user = await get_current_user(request)
