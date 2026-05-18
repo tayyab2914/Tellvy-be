@@ -57,6 +57,30 @@ APP_NAME = "tellvy"
 
 # Gemini AI
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# The Gemini client (and its SDK import) is created once and reused. Building it
+# per request — as the AI endpoints used to — added several seconds of latency
+# to every call, which is why the generation spinner could hang for 20s+.
+_gemini_client = None
+
+def get_gemini_client():
+    """Return a cached Gemini client, or None if the SDK/key is unavailable."""
+    global _gemini_client
+    if _gemini_client is None and GEMINI_API_KEY:
+        try:
+            from google import genai
+            from google.genai import types
+            _gemini_client = genai.Client(
+                api_key=GEMINI_API_KEY,
+                # Timeout in ms — if Gemini is slow we fail fast to the offline
+                # fallback instead of leaving the user staring at a spinner.
+                # Gemini rejects deadlines under 10s, so 10000 is the floor.
+                http_options=types.HttpOptions(timeout=10000),
+            )
+        except Exception as e:
+            logger.error(f"Gemini client init failed: {e}")
+            _gemini_client = None
+    return _gemini_client
+
 # Outscraper
 OUTSCRAPER_API_KEY = os.environ.get("OUTSCRAPER_API_KEY")
 storage_key = None
@@ -1367,28 +1391,33 @@ REVIEW_OPENERS = [
 ]
 REVIEW_LENGTHS = ["1 short sentence", "2 sentences", "2-3 sentences", "3 sentences"]
 
+# {tags} is filled with the lowercase tag word(s) and always slots in as an
+# adjective after "felt"/"was", so the sentence stays grammatical whatever the
+# tag is — never treat the tag as a standalone noun ("I struggled with dirty").
 LOW_REVIEW_FALLBACKS = [
-    "My experience with {member} fell short of what I expected, particularly around {tags}. I hope the team can address this so future visits go more smoothly.",
-    "Unfortunately my visit with {member} was disappointing — {tags} could really use some attention. I'd like to see improvements here.",
-    "I wanted to share some honest feedback: {member} missed the mark for me when it came to {tags}. There's definitely room to do better.",
-    "Things didn't go as well as I'd hoped with {member}. {tags_cap} left me underwhelmed, and I think this is worth the team looking into.",
-    "My time with {member} was below expectations. I struggled with {tags}, and I hope sharing this helps the team improve.",
+    "My experience with {member} fell short of what I expected — the visit felt {tags}, and I hope the team can address that so future visits go more smoothly.",
+    "Unfortunately my visit with {member} was disappointing. Things felt {tags}, and I'd really like to see that improved.",
+    "I wanted to share some honest feedback: my time with {member} felt {tags}, and there's definitely room to do better.",
+    "Things didn't go as well as I'd hoped with {member}. The whole experience came across as {tags}, which left me underwhelmed.",
+    "My visit with {member} was below expectations — it felt {tags}, and I hope sharing this helps the team improve.",
 ]
 HIGH_REVIEW_FALLBACKS = [
-    "Had a great experience with {member} — genuinely impressed by how {tags} they were throughout. Would happily come back.",
-    "{member_cap} took great care of me from start to finish. The {tags} really stood out and made the whole visit easy.",
-    "Really pleased with my visit. {member_cap} was {tags}, and it made all the difference. Highly recommend stopping by.",
-    "So glad I chose this place. {member_cap} was {tags} and made me feel completely looked after.",
-    "A wonderful experience all around. {member_cap} was {tags}, and I'll definitely be recommending them to friends.",
+    "Had a great experience with {member} — the whole visit felt {tags}, and I'd happily come back.",
+    "{member_cap} took great care of me from start to finish. The visit was {tags}, which made everything easy.",
+    "Really pleased with my visit. Everything felt {tags}, and {member} made all the difference.",
+    "So glad I chose this place. The experience was {tags} and {member} made me feel completely looked after.",
+    "A wonderful experience all around — it felt {tags}, and I'll definitely be recommending {member} to friends.",
 ]
 
 @api_router.post("/ai/magic-write")
 async def magic_write(req: MagicWriteRequest):
     is_low = req.rating and req.rating <= 3
-    # Inject the selected tag words entirely in lowercase so they read naturally
-    # inside a sentence (e.g. "they were gentle and professional") instead of
-    # appearing as awkward capitalised words mid-review.
+    # Tags are *themes* the review should cover — never words to drop in verbatim.
+    # Forcing the literal tag word into a fixed template produced broken English
+    # ("Ahmet was clean", "I struggled with dirty"). The prompt now hands the tag
+    # to the model as a topic and lets it write a grammatical sentence around it.
     tags_lower = [t.lower().strip() for t in req.tags if t and t.strip()]
+    themes = ", ".join(tags_lower) if tags_lower else "the overall experience"
     # Per-request variation so the same inputs never yield an identical review.
     tone = random.choice(REVIEW_TONES)
     opener = random.choice(REVIEW_OPENERS)
@@ -1397,86 +1426,116 @@ async def magic_write(req: MagicWriteRequest):
     variation_seed = random.randint(1, 2_000_000_000)
     temperature = round(random.uniform(1.0, 1.3), 2)
     try:
-        from google import genai
         from google.genai import types
-        gemini = genai.Client(api_key=GEMINI_API_KEY)
+        gemini = get_gemini_client()
+        if gemini is None:
+            raise RuntimeError("Gemini client unavailable")
         if is_low:
             prompt = (
-                f"Write a natural, honest {req.rating}-star Google review ({length}) mentioning {req.member_name}. "
-                f"The customer felt these areas fell short of expectations: {', '.join(tags_lower)}. "
-                f"Always write those words in lowercase within the sentence so they read naturally. "
-                f"Category: {req.category}. Tone: {tone}. {opener} "
-                f"The review must be constructive and fair — clearly convey that the experience was below "
-                f"expectations and describe what could be improved. Do NOT write a cheerful or glowing review; "
-                f"it must read as a genuine {req.rating}-star rating. "
-                f"Make the wording, structure, and phrasing completely original — it must not resemble any other "
-                f"review. Avoid generic stock phrases. Variation token: {variation_seed}."
+                f"Write a believable {req.rating}-star Google review in natural, grammatically correct English.\n"
+                f"Length: {length}. Tone: {tone}. {opener}\n"
+                f"Context:\n"
+                f"- {req.member_name} is the staff member who served the customer.\n"
+                f"- Business category: {req.category}.\n"
+                f"- The customer was disappointed and wants the review to raise these concerns: {themes}.\n"
+                f"Rules:\n"
+                f"- Treat each concern as a TOPIC, not a word to insert verbatim. Rephrase it into a "
+                f"grammatically correct sentence — e.g. the concern 'dirty' becomes 'the clinic felt unclean' "
+                f"or 'some areas weren't as clean as I expected', never 'I struggled with dirty'.\n"
+                f"- A concern usually describes the place, the wait, or the procedure — NOT {req.member_name} as "
+                f"a person. Only attribute it to {req.member_name} if that genuinely makes grammatical sense.\n"
+                f"- It must clearly read as a critical {req.rating}-star rating: honest, fair and constructive, "
+                f"never cheerful or glowing.\n"
+                f"- Sound like a real customer. Original wording, no stock phrases, no quotation marks. "
+                f"Variation token: {variation_seed}."
             )
             system_instruction = (
-                "You are a helpful review writer assisting a customer who had a disappointing experience. "
-                "Generate a short, honest, constructive Google review that clearly matches a low (1-3 star) rating. "
-                "Focus on specific areas for improvement in a calm, fair, non-aggressive tone. NEVER write a "
-                "positive or 5-star-style review for a low rating. Sound like a real customer, not robotic. "
-                "Every review must be uniquely worded — never repeat sentence structures or phrasing from earlier "
-                "reviews, even for the same inputs. Do not use quotation marks around the review."
+                "You write short, honest, constructive Google reviews for customers who had a disappointing "
+                "experience. Every sentence must be natural and grammatically correct — never force a supplied "
+                "word into an awkward sentence; rephrase the idea so it reads like real English. The review must "
+                "match the low star rating and never sound positive. Vary the wording every time. No quotation "
+                "marks around the review."
             )
         else:
             prompt = (
-                f"Write a natural, positive {req.rating}-star Google review ({length}) mentioning {req.member_name}. "
-                f"The review should touch on these qualities: {', '.join(tags_lower)}. "
-                f"Always write those quality words in lowercase within the sentence so they read naturally. "
-                f"Category: {req.category}. Tone: {tone}. {opener} Sound authentic and human. "
-                f"Make the wording, structure, and phrasing completely original — every review must be noticeably "
-                f"different from the last, even for the same qualities. Avoid generic stock phrases such as "
-                f"'highly recommend' unless it genuinely fits. Variation token: {variation_seed}."
+                f"Write a believable {req.rating}-star Google review in natural, grammatically correct English.\n"
+                f"Length: {length}. Tone: {tone}. {opener}\n"
+                f"Context:\n"
+                f"- {req.member_name} is the staff member who served the customer.\n"
+                f"- Business category: {req.category}.\n"
+                f"- The customer was happy and wants the review to highlight these positives: {themes}.\n"
+                f"Rules:\n"
+                f"- Treat each positive as a TOPIC, not a word to insert verbatim. Rephrase it into a "
+                f"grammatically correct sentence — e.g. the positive 'clean' becomes 'the clinic was spotless', "
+                f"never '{req.member_name} was clean'.\n"
+                f"- Attribute each quality to whatever it naturally fits — the place, the service, or "
+                f"{req.member_name} — so the sentence makes sense.\n"
+                f"- Sound authentic and human. Original wording, avoid stock phrases like 'highly recommend' "
+                f"unless it genuinely fits. No quotation marks. Variation token: {variation_seed}."
             )
             system_instruction = (
-                "You are a helpful review writer. Generate short, natural-sounding Google reviews. Sound like a "
-                "real customer, not robotic. Every review must be uniquely worded — never repeat sentence "
-                "structures, openings, or phrasing from earlier reviews, even for identical inputs, so the reviews "
-                "never look duplicated or spammy. Do not use quotation marks around the review."
+                "You write short, natural-sounding, grammatically correct Google reviews. Never force a supplied "
+                "word into an awkward sentence — rephrase the idea so it reads like real English a customer would "
+                "actually write. Vary the wording, structure and opening every time so reviews never look "
+                "duplicated or spammy. No quotation marks around the review."
             )
         result = await gemini.aio.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=temperature,
                 top_p=0.95,
                 seed=variation_seed,
+                # A 2-3 sentence review needs very few tokens — cap it so the
+                # model never over-generates.
+                max_output_tokens=220,
+                # Disable the model's internal "thinking" pass. On gemini-2.5
+                # it is on by default and was the main cause of the 20s+ wait;
+                # short review text does not need it.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        return {"review_draft": result.text, "member_name": req.member_name, "tags": req.tags}
+        print(f"AI Magic Write result: {result.text}")
+        return {"review_draft": (result.text or "").strip(), "member_name": req.member_name, "tags": req.tags}
     except Exception as e:
         logger.error(f"AI Magic Write error: {e}")
         # Offline fallback: still rotate through varied templates so repeated
-        # failures don't hand out the same canned sentence.
-        tags_str = " and ".join(tags_lower[:2]) if tags_lower else "the service"
+        # failures don't hand out the same canned sentence. {tags} is an
+        # adjective phrase ("dirty", "clean and efficient") so it reads
+        # naturally after the template's "felt"/"was".
+        tags_str = " and ".join(tags_lower[:2]) if tags_lower else (
+            "below par" if is_low else "great"
+        )
         template = random.choice(LOW_REVIEW_FALLBACKS if is_low else HIGH_REVIEW_FALLBACKS)
         fallback = template.format(
             member=req.member_name,
             member_cap=req.member_name,
             tags=tags_str,
-            tags_cap=tags_str[:1].upper() + tags_str[1:] if tags_str else tags_str,
         )
         return {"review_draft": fallback, "member_name": req.member_name, "tags": req.tags}
 
 @api_router.post("/ai/response-assist")
 async def response_assist(req: ResponseAssistRequest):
     try:
-        from google import genai
         from google.genai import types
-        gemini = genai.Client(api_key=GEMINI_API_KEY)
+        gemini = get_gemini_client()
+        if gemini is None:
+            raise RuntimeError("Gemini client unavailable")
         sentiment = "positive" if req.rating >= 4 else "mixed" if req.rating == 3 else "negative"
         prompt = f"Write a professional business response to this {sentiment} {req.rating}-star review: \"{req.review_text}\". Category: {req.category}. Remember: do NOT mention the reviewer's name or any specific services."
         result = await gemini.aio.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction="You are a professional business response writer. Write brief, warm responses to customer reviews. IMPORTANT: Never repeat the reviewer's name or any specific service/medical details mentioned in the review to protect privacy (HIPAA/GDPR). Keep responses to 2-3 sentences.",
+                max_output_tokens=220,
+                # Disable the internal "thinking" pass — it is on by default on
+                # gemini-2.5 and adds many seconds of latency this task doesn't need.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        return {"response_draft": result.text}
+        return {"response_draft": (result.text or "").strip()}
     except Exception as e:
         logger.error(f"AI Response Assist error: {e}")
         return {"response_draft": "Thank you for taking the time to share your feedback. We truly value your experience and are committed to providing the best service possible."}
