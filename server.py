@@ -1445,22 +1445,20 @@ async def magic_write(req: MagicWriteRequest):
                 f"- Business category: {req.category}.\n"
                 f"- The customer was disappointed and wants the review to raise these concerns: {themes}.\n"
                 f"Rules:\n"
-                f"- Treat each concern as a TOPIC, not a word to insert verbatim. Rephrase it into a "
-                f"grammatically correct sentence — e.g. the concern 'dirty' becomes 'the clinic felt unclean' "
-                f"or 'some areas weren't as clean as I expected', never 'I struggled with dirty'.\n"
-                f"- A concern usually describes the place, the wait, or the procedure — NOT {req.member_name} as "
-                f"a person. Only attribute it to {req.member_name} if that genuinely makes grammatical sense.\n"
-                f"- It must clearly read as a critical {req.rating}-star rating: honest, fair and constructive, "
-                f"never cheerful or glowing.\n"
+                f"- Translate the customer concerns into physical or emotional sensations that are highly specific "
+                f"to the '{req.category}' vertical (e.g., if it's a dental clinic, 'dirty' should mean their teeth, "
+                f"mouth, or gums did not feel properly cleaned/polished or plaque was missed. If it's a restaurant, "
+                f"it should mean food prep, tables, or plates felt unhygienic).\n"
+                f"- Attribute the quality naturally to whatever fits best—the service, the treatment, or {req.member_name}.\n"
+                f"- It must clearly read as a critical {req.rating}-star rating: honest, fair and constructive, never glowing.\n"
                 f"- Sound like a real customer. Original wording, no stock phrases, no quotation marks. "
                 f"Variation token: {variation_seed}."
             )
             system_instruction = (
-                "You write short, honest, constructive Google reviews for customers who had a disappointing "
-                "experience. Every sentence must be natural and grammatically correct — never force a supplied "
-                "word into an awkward sentence; rephrase the idea so it reads like real English. The review must "
-                "match the low star rating and never sound positive. Vary the wording every time. No quotation "
-                "marks around the review."
+                f"You write short, honest, constructive Google reviews for a disappointing experience at a '{req.category}'. "
+                f"The review MUST capture the physical results or customer feelings specific to that industry (e.g. for a dental practice, "
+                f"focus on oral care results, teeth, comfort, or cleanings; for food, focus on taste, freshness, or hygiene). "
+                f"Never force a tag verbatim; rephrase it smoothly into natural English. No quotation marks."
             )
         else:
             prompt = (
@@ -1471,19 +1469,19 @@ async def magic_write(req: MagicWriteRequest):
                 f"- Business category: {req.category}.\n"
                 f"- The customer was happy and wants the review to highlight these positives: {themes}.\n"
                 f"Rules:\n"
-                f"- Treat each positive as a TOPIC, not a word to insert verbatim. Rephrase it into a "
-                f"grammatically correct sentence — e.g. the positive 'clean' becomes 'the clinic was spotless', "
-                f"never '{req.member_name} was clean'.\n"
-                f"- Attribute each quality to whatever it naturally fits — the place, the service, or "
-                f"{req.member_name} — so the sentence makes sense.\n"
-                f"- Sound authentic and human. Original wording, avoid stock phrases like 'highly recommend' "
-                f"unless it genuinely fits. No quotation marks. Variation token: {variation_seed}."
+                f"- Translate the customer positives into physical results or human sensations that are highly specific "
+                f"to the '{req.category}' vertical (e.g., if it's a dental clinic, 'clean' should mean their teeth "
+                f"felt incredibly fresh, spotless, polished, or their smile looked brighter. If it's a restaurant, "
+                f"it should mean food was fresh, delicious, or tables were immaculate).\n"
+                f"- Attribute each quality naturally to the experience, the physical results, or {req.member_name}.\n"
+                f"- Sound authentic and human. Original wording, avoid robotic stock phrases. No quotation marks. "
+                f"Variation token: {variation_seed}."
             )
             system_instruction = (
-                "You write short, natural-sounding, grammatically correct Google reviews. Never force a supplied "
-                "word into an awkward sentence — rephrase the idea so it reads like real English a customer would "
-                "actually write. Vary the wording, structure and opening every time so reviews never look "
-                "duplicated or spammy. No quotation marks around the review."
+                f"You write short, natural-sounding, emotionally authentic Google reviews for a positive experience at a '{req.category}'. "
+                f"The review MUST focus on the specific physical results or human feelings associated with that industry (e.g. for dental care, "
+                f"focus on teeth feeling clean, polished, fresh, or feeling relaxed; for dining, focus on flavor, preparation, or atmosphere). "
+                f"Rephrase all tags into smooth sentences. No quotation marks."
             )
         result = await gemini.aio.models.generate_content(
             model="gemini-2.5-flash",
